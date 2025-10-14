@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-AI+数据——校园用户识别 挑战赛：可运行的Baseline脚本
-------------------------------------------------
-特点：
-1) 自动发现数据文件（train/test/submit）并兼容不同命名；
-2) 完整特征工程：日期解析、比例/强度/时间段占比等；
-3) LightGBM 五折交叉验证 + 阈值自动寻优（按F1最大化）；
-4) 若缺少 LightGBM，自动回退到 XGBoost 或 Logistic Regression；
-5) 生成提交文件 submission.csv 以及特征重要性 feature_importance.csv。
-
-使用方法（在比赛平台 Jupyter 或本地同目录运行）：
-$ python campus_baseline.py
-
-输出：
-- submission.csv  # 按官方要求：user_id,is_positive
-- feature_importance.csv  # 便于后续挑参与特征改进
-
-注意：
-- 仅使用官方字段，不引入外部数据；
-- 设定了随机种子，保证可复现；
-- 若你使用的是线性/逻辑回归回退路径，建议改用树模型以获得更好效果。
-"""
-
 import os
 import sys
 import gc
@@ -281,7 +258,7 @@ def fit_predict_with_lgb(train_df: pd.DataFrame, test_df: pd.DataFrame, features
         )
 
         # 验证集预测 + 阈值搜索（按F1最大化）
-        val_prob = clf.predict(dval, iteration_range=(0, clf.best_iteration + 1))
+        val_prob = clf.predict(X_val, num_iteration=clf.best_iteration)
         oof_pred[val_idx] = val_prob
 
         # 阈值扫描
@@ -294,7 +271,7 @@ def fit_predict_with_lgb(train_df: pd.DataFrame, test_df: pd.DataFrame, features
         print(f"[Fold {fold}] best F1={max(f1s):.5f} @ thr={best_thr:.3f}")
 
         # 测试集预测累计
-        tst_prob = clf.predict(dtest, iteration_range=(0, clf.best_iteration + 1))
+        tst_prob = clf.predict(X_test, num_iteration=clf.best_iteration)
         tst_pred += tst_prob / skf.n_splits
 
         # 特征重要性
@@ -356,8 +333,11 @@ def fit_predict_with_xgb(train_df: pd.DataFrame, test_df: pd.DataFrame, features
             dtrn,
             num_boost_round=5000,
             evals=[(dtrn, "train"), (dval, "valid")],
-            early_stopping_rounds=200,
-            verbose_eval=200,
+            callbacks=[
+                lgb.early_stopping(200),
+                lgb.log_evaluation(200),
+            ],
+
         )
 
         val_prob = clf.predict(dval, ntree_limit=clf.best_ntree_limit)
