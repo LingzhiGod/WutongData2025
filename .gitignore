@@ -1,2 +1,6 @@
 /.idea/
 /debug/
+/compare_report.txt
+/diff_samples.csv
+/feature_importance.csv
+/submission.csv
