@@ -1,0 +1,269 @@
+import os
+import sys
+import gc
+import math
+import glob
+import json
+import warnings
+from typing import List, Tuple, Dict
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
+from sklearn.preprocessing import LabelEncoder
+
+warnings.filterwarnings("ignore")
+
+#--------------------------------------
+#Constant Pool
+#--------------------------------------
+TRAIN_FP = "./train.csv"
+TEST_FP = "./test.csv"
+
+ID_COL = "user_id"
+DATE_COL = "registration_date"
+TARGET = "is_positive"
+REG_YEAR = "reg_year"
+REG_MONTH = "reg_month"
+REG_DAY_SINCE_REF = "reg_days_since_ref"
+
+CAT_COLS_RAW = [
+    "registration_channel_id",
+    "gender",  # 1男 2女（后续转0/1）
+    "uses_education_app",  # 0/1
+    "uses_entertainment_app",
+    "uses_shopping_app",
+    "residence_base_station_id",  # 高基数ID，树模型可直接做类别特征
+    "residence_cell_id",
+    "tariff_id",
+    REG_YEAR,
+    REG_MONTH,
+]
+
+NUM_COLS_RAW = [
+    "age",
+    "over_limit_data(MB)",
+    "tariff_price(RMB)",
+    "total_data(MB)",
+    "total_voice(minutes)",
+    "call_duration(minutes)",
+    "monthly_call_count",
+    "monthly_weekend_call_count",
+    "avg_call_duration(minutes)",
+    "avg_weekday_call_duration(minutes)",
+    "avg_weekend_call_duration(minutes)",
+    "residence_duration_9to11",
+    "residence_duration_11to14",
+    "residence_duration_14to17",
+    "residence_duration_17to21",
+    "residence_duration_21to23",
+    "residence_duration_24to6",
+    "total_residence_duration",
+]
+
+REF_DATE = pd.to_datetime("2020-12-31")
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+#--------------------------------------
+
+lgbm_params = dict(
+        objective="binary",
+        metric=["binary_logloss", "auc"],
+        learning_rate=0.05,
+        num_leaves=31,
+        max_depth=-1,
+        feature_fraction=0.8,
+        bagging_fraction=0.8,
+        bagging_freq=1,
+        min_data_in_leaf=20,
+        seed=RANDOM_STATE,
+        n_jobs=-1,
+        verbose=-1,
+)
+
+def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, features: List[str]) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float]:
+    import lightgbm as lgb
+
+    oof_pred = np.zeros(len(train_df))
+    tst_pred = np.zeros(len(test_df))
+
+    fi_list = []
+    thresholds = []
+
+    X = train_df[features]
+    y = train_df[TARGET].astype(int).values
+    X_test = test_df[features]
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+    for fold, (trn_idx, val_idx) in enumerate(skf.split(X, y), 1):
+        X_trn, y_trn = X.iloc[trn_idx], y[trn_idx]
+        X_val, y_val = X.iloc[val_idx], y[val_idx]
+
+        lgb_trn = lgb.Dataset(X_trn, label=y_trn)
+        lgb_val = lgb.Dataset(X_val, label=y_val)
+
+        clf = lgb.train(
+            lgbm_params,
+            lgb_trn,
+            num_boost_round=2000,
+            valid_sets=[lgb_trn, lgb_val],
+            valid_names=["train", "valid"],
+            callbacks=[
+                lgb.early_stopping(100),
+                lgb.log_evaluation(100),
+            ],
+        )
+
+        # 验证集预测 + 阈值搜索（按F1最大化）
+        val_prob = clf.predict(X_val, num_iteration=clf.best_iteration)
+        oof_pred[val_idx] = val_prob
+
+        # 阈值扫描
+        thr_candidates = np.linspace(0.2, 0.8, 61)  # 0.2~0.8 步长0.01
+        f1s = []
+        for thr in thr_candidates:
+            f1s.append(f1_score(y_val, (val_prob >= thr).astype(int)))
+        best_thr = float(thr_candidates[int(np.argmax(f1s))])
+        thresholds.append(best_thr)
+        print(f"[Fold {fold}] best F1={max(f1s):.5f} @ thr={best_thr:.3f}")
+
+        # 测试集预测累计
+        tst_prob = clf.predict(X_test, num_iteration=clf.best_iteration)
+        tst_pred += tst_prob / skf.n_splits
+
+        # 特征重要性
+        fi = pd.DataFrame({
+            "feature": features,
+            "importance": clf.feature_importance(importance_type="gain"),
+            "fold": fold,
+        })
+        fi_list.append(fi)
+
+        del clf, lgb_trn, lgb_val
+        gc.collect()
+    oof_thr = float(np.mean(thresholds))
+    print("[OOF] Using average limit: thr={oof_thr:.3f}")
+    fi_df = pd.concat(fi_list, axis=0, ignore_index=True)
+    return oof_pred, tst_pred, fi_df, oof_thr
+
+
+#--------------------------------------
+# Util functions
+#--------------------------------------
+def find_file(candidates: List[str]) -> str:
+    for pat in candidates:
+        files = glob.glob(pat)
+        if files:
+            return files[0]
+    return ""
+
+def load_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    train_fp = find_file(TRAIN_FP)
+    test_fp = find_file(TEST_FP)
+
+    print("[Info]Loading data...")
+
+    if not train_fp or not test_fp:
+        print("[ERROR] train/test csv not found。")
+        sys.exit(1)
+
+    train = pd.read_csv(TRAIN_FP)
+    test = pd.read_csv(TEST_FP)
+
+    return train, test
+#--------------------------------------
+#Feature Buildup
+#--------------------------------------
+
+encoders = {}
+
+def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
+    df = df.copy()
+
+    #Process Date
+    if DATE_COL in df.columns:
+        df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+        df[REG_YEAR] = df[DATE_COL].dt.year
+        df[REG_MONTH] = df[DATE_COL].dt.month
+        df[REG_DAY_SINCE_REF] = (df[DATE_COL] - REF_DATE).dt.days.astype("float32") #手动转换规定转换行为避免不可预料的错误
+    else:
+        df[REG_YEAR] = np.nan
+        df[REG_MONTH] = np.nan
+        df[REG_DAY_SINCE_REF] = np.nan
+
+    #Type Convert
+    for name in NUM_COLS_RAW:
+        if name in df.columns:
+            df[name] = pd.to_numeric(df[name], errors="coerce")
+    for name in CAT_COLS_RAW:
+        if name in df.columns:
+            df[name] = df[name].astype(str)
+
+    #Label Encoding
+    if is_train:
+        for cat in CAT_COLS_RAW:
+            if cat in df.columns:
+                encoder = LabelEncoder()
+                df[cat + "_le"] = encoder.fit_transform(df[cat].astype(str))
+                encoders[cat] = encoder
+    else:
+        for cat in CAT_COLS_RAW:
+            if cat in df.columns:
+                encoder = encoders.get(cat)
+                if encoder is not None:
+                    unseen = set(df[cat].astype(str)) - set(encoder.classes_)
+                    if unseen:
+                        encoder.classes_ = np.append(encoder.classes_, list(unseen)) #New value as UNK Label for code robust
+                    df[cat + "_le"] = encoder.transform(df[cat].astype(str))
+
+    #New Feature Generation
+    using_cols = []
+
+
+    using_cols += [n for n in NUM_COLS_RAW if n in df.columns]
+    using_cols += [c + "_le" for c in CAT_COLS_RAW if c in df.columns]
+    print("[Info]Features built, using " + str(len(using_cols)) + " features:", using_cols)
+    df["__used_cols__"] = ",".join(using_cols)
+    return df
+
+def main():
+    train, test = load_data()
+
+    train_fe = build_features(train, is_train=True)
+    test_fe = build_features(test, is_train=False)
+
+    using_cols = train_fe["__used_cols__"].iloc[0].split(",")
+
+    oof, pred, fi_df, thr = fit_predict_with_lgbm(train_fe, test_fe, using_cols)
+    try:
+        import lightgbm
+        print("[INFO]Training LGBM...")
+    except Exception as e_lgb:
+        print("[ERROR] Failed when training by using lightgbm.")
+        print("[ERROR] Error: " + str(e_lgb))
+
+    y_true = train[TARGET].astype(int).values
+    oof_label = (oof >= thr).astype(int)
+    acc = accuracy_score(y_true, oof_label)
+    f1 = f1_score(y_true, oof_label)
+    pre = precision_score(y_true, oof_label)
+    rec = recall_score(y_true, oof_label)
+    print(f"[OOF] Acc={acc:.5f}  F1={f1:.5f}  P={pre:.5f}  R={rec:.5f}  Thr={thr:.3f}")
+
+    sub = pd.DataFrame({
+        ID_COL: test[ID_COL].values,
+        TARGET: (pred >= thr).astype(int)
+    })
+    sub.to_csv("submission.csv", index=False)
+    print("[OK] 已生成 submission.csv")
+
+    # 保存特征重要性
+    if fi_df is not None and not fi_df.empty:
+        fi_agg = fi_df.groupby("feature", as_index=False)["importance"].mean().sort_values("importance", ascending=False)
+        fi_agg.to_csv("feature_importance.csv", index=False)
+        print("[OK] 已生成 feature_importance.csv（gain 平均值）")
+
+if __name__ == "__main__":
+    main()
