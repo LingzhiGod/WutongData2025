@@ -67,11 +67,11 @@ RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 #--------------------------------------
 
-lgbm_params = dict(
+lgbm_default_params = dict(
         objective="binary",
         metric=["binary_logloss", "auc"],
         learning_rate=0.05,
-        num_leaves=31,
+        num_leaves=63,
         max_depth=-1,
         feature_fraction=0.8,
         bagging_fraction=0.8,
@@ -81,6 +81,46 @@ lgbm_params = dict(
         n_jobs=-1,
         verbose=-1,
 )
+
+def load_best_params(default_params: dict, filename: str = "optuna_best_params.csv") -> dict:
+    if not os.path.exists(filename):
+        print(f"[Optuna]{filename} not found,using default params.")
+        return default_params
+
+    try:
+        best_df = pd.read_csv(filename)
+        best_params = best_df.iloc[0].to_dict()
+        best_f1 = best_params.pop("best_f1", None)
+
+        int_keys = {"num_leaves", "max_depth", "min_data_in_leaf", "bagging_freq"}
+
+        for k, v in best_params.items():
+            if isinstance(v, str):
+                try:
+                    if v.lower() in ["true", "false"]:
+                        best_params[k] = v.lower() == "true"
+                    elif "." in v:
+                        best_params[k] = float(v)
+                    else:
+                        best_params[k] = int(v)
+                except Exception:
+                    pass
+            elif isinstance(v, float) and k in int_keys:
+                best_params[k] = int(v)
+
+        updated = default_params.copy()
+        updated.update(best_params)
+
+        print(f"[Optuna]Loaded ({filename})")
+        if best_f1 is not None:
+            print(f"[Optuna]Best F1 = {best_f1:.5f}")
+        print(f"[Optuna]Loaded params：{list(best_params.keys())}")
+
+        return updated
+    except Exception as e:
+        print(f"[Optuna]Failed when loading best param：{e}")
+        return default_params
+
 
 def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, features: List[str]) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float]:
     import lightgbm as lgb
@@ -94,6 +134,8 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
     X = train_df[features]
     y = train_df[TARGET].astype(int).values
     X_test = test_df[features]
+
+    lgbm_params = load_best_params(lgbm_default_params)
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
 
