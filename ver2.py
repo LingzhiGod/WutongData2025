@@ -278,7 +278,6 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
 
     using_cols.append("total_call_duration")
 
-
     weekend_call_count = df.get("monthly_weekend_call_count", 0)
     weekday_call_count = total_call_count - weekend_call_count
     df["monthly_weekday_call_count"] = weekday_call_count
@@ -291,8 +290,8 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
     using_cols.append("ratio_weekday_call")
     using_cols.append("ratio_weekend_call")
 
-    avg_weekday_call_dura = df.get("avg_weekend_call_duration(minutes)", 0)
-    avg_weekend_call_dura = df.get("avg_weekday_call_duration(minutes)", 0)
+    avg_weekday_call_dura = df.get("avg_weekday_call_duration(minutes)", 0)
+    avg_weekend_call_dura = df.get("avg_weekend_call_duration(minutes)", 0)
     ratio_weekday_call_dura = np.where(total_call == 0, 0.5, avg_weekday_call_dura * weekday_call_count / total_call)
     ratio_weekend_call_dura = np.where(total_call == 0, 0.5, avg_weekend_call_dura * weekend_call_count / total_call)
     df["ratio_weekday_call_dura"] = ratio_weekday_call_dura
