@@ -63,7 +63,7 @@ NUM_COLS_RAW = [
 ]
 
 REF_DATE = pd.to_datetime("2020-12-31")
-RANDOM_STATE = 42
+RANDOM_STATE = 20
 np.random.seed(RANDOM_STATE)
 #--------------------------------------
 
@@ -137,7 +137,7 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
 
     lgbm_params = load_best_params(lgbm_default_params)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_STATE)
 
     for fold, (trn_idx, val_idx) in enumerate(skf.split(X, y), 1):
         X_trn, y_trn = X.iloc[trn_idx], y[trn_idx]
