@@ -215,6 +215,14 @@ def load_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
     test = pd.read_csv(TEST_FP)
 
     return train, test
+
+def safe_div(a, b):
+    return a / np.where(b == 0, 1, b)
+
+def wow(a,b,total,which):
+    if total == 0:
+        return 0.5
+    return np.where(which, a, b) / total
 #--------------------------------------
 #Feature Buildup
 #--------------------------------------
@@ -263,6 +271,34 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
     #New Feature Generation
     using_cols = []
 
+    avg_call = df.get("call_duration(minutes)",0)
+    total_call_count = df.get("monthly_call_count",0)
+    total_call = avg_call * total_call_count
+    df["total_call_duration"] = total_call
+
+    using_cols.append("total_call_duration")
+
+
+    weekend_call_count = df.get("monthly_weekend_call_count", 0)
+    weekday_call_count = total_call_count - weekend_call_count
+    df["monthly_weekday_call_count"] = weekday_call_count
+    using_cols.append("monthly_weekday_call_count")
+
+    ratio_weekday_call = np.where(total_call_count == 0, 0.5, weekday_call_count / total_call_count)
+    ratio_weekend_call = np.where(total_call_count == 0, 0.5, weekend_call_count / total_call_count)
+    df["ratio_weekday_call"] = ratio_weekday_call
+    df["ratio_weekend_call"] = ratio_weekend_call
+    using_cols.append("ratio_weekday_call")
+    using_cols.append("ratio_weekend_call")
+
+    avg_weekday_call_dura = df.get("avg_weekend_call_duration(minutes)", 0)
+    avg_weekend_call_dura = df.get("avg_weekday_call_duration(minutes)", 0)
+    ratio_weekday_call_dura = np.where(total_call == 0, 0.5, avg_weekday_call_dura * weekday_call_count / total_call)
+    ratio_weekend_call_dura = np.where(total_call == 0, 0.5, avg_weekend_call_dura * weekend_call_count / total_call)
+    df["ratio_weekday_call_dura"] = ratio_weekday_call_dura
+    df["ratio_weekend_call_dura"] = ratio_weekend_call_dura
+    using_cols.append("ratio_weekday_call_dura")
+    using_cols.append("ratio_weekend_call_dura")
 
     using_cols += [n for n in NUM_COLS_RAW if n in df.columns]
     using_cols += [c + "_le" for c in CAT_COLS_RAW if c in df.columns]
