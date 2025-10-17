@@ -232,18 +232,18 @@ encoders = {}
 def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
     df = df.copy()
 
-    #Process Date
+    # Process Date
     if DATE_COL in df.columns:
         df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
         df[REG_YEAR] = df[DATE_COL].dt.year
         df[REG_MONTH] = df[DATE_COL].dt.month
-        df[REG_DAY_SINCE_REF] = (df[DATE_COL] - REF_DATE).dt.days.astype("float32") #手动转换规定转换行为避免不可预料的错误
+        df[REG_DAY_SINCE_REF] = (df[DATE_COL] - REF_DATE).dt.days.astype("float32")  # 手动转换规定转换行为避免不可预料的错误
     else:
         df[REG_YEAR] = np.nan
         df[REG_MONTH] = np.nan
         df[REG_DAY_SINCE_REF] = np.nan
 
-    #Type Convert
+    # Type Convert
     for name in NUM_COLS_RAW:
         if name in df.columns:
             df[name] = pd.to_numeric(df[name], errors="coerce")
@@ -251,28 +251,11 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
         if name in df.columns:
             df[name] = df[name].astype(str)
 
-    #Label Encoding
-    if is_train:
-        for cat in CAT_COLS_RAW:
-            if cat in df.columns:
-                encoder = LabelEncoder()
-                df[cat + "_le"] = encoder.fit_transform(df[cat].astype(str))
-                encoders[cat] = encoder
-    else:
-        for cat in CAT_COLS_RAW:
-            if cat in df.columns:
-                encoder = encoders.get(cat)
-                if encoder is not None:
-                    unseen = set(df[cat].astype(str)) - set(encoder.classes_)
-                    if unseen:
-                        encoder.classes_ = np.append(encoder.classes_, list(unseen)) #New value as UNK Label for code robust
-                    df[cat + "_le"] = encoder.transform(df[cat].astype(str))
-
-    #New Feature Generation
+    # New Feature Generation
     using_cols = []
 
-    avg_call = df.get("call_duration(minutes)",0)
-    total_call_count = df.get("monthly_call_count",0)
+    avg_call = df.get("call_duration(minutes)", 0)
+    total_call_count = df.get("monthly_call_count", 0)
     total_call = avg_call * total_call_count
     df["total_call_duration"] = total_call
 
@@ -298,6 +281,34 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
     df["ratio_weekend_call_dura"] = ratio_weekend_call_dura
     using_cols.append("ratio_weekday_call_dura")
     using_cols.append("ratio_weekend_call_dura")
+
+    # Price per MB (robust handling when total_data == 0)
+    price = pd.to_numeric(df.get("tariff_price(RMB)", 0), errors="coerce")
+    data_mb = pd.to_numeric(df.get("total_data(MB)", 0), errors="coerce")
+    df["no_data_allowance_flag"] = (data_mb <= 0).astype(int)
+    # 当总流量为 0 时，该值不可定义：设为 NaN 以让树模型按缺失处理，并配合 no_data_allowance_flag 提示语义
+    df["price_per_mb"] = np.where(data_mb > 0, price / data_mb, np.nan)
+    using_cols.append("no_data_allowance_flag")
+    using_cols.append("price_per_mb")
+    CAT_COLS_RAW.append("no_data_allowance_flag")
+
+    # Label Encoding
+    if is_train:
+        for cat in CAT_COLS_RAW:
+            if cat in df.columns:
+                encoder = LabelEncoder()
+                df[cat + "_le"] = encoder.fit_transform(df[cat].astype(str))
+                encoders[cat] = encoder
+    else:
+        for cat in CAT_COLS_RAW:
+            if cat in df.columns:
+                encoder = encoders.get(cat)
+                if encoder is not None:
+                    unseen = set(df[cat].astype(str)) - set(encoder.classes_)
+                    if unseen:
+                        encoder.classes_ = np.append(encoder.classes_,
+                                                     list(unseen))  # New value as UNK Label for code robust
+                    df[cat + "_le"] = encoder.transform(df[cat].astype(str))
 
     using_cols += [n for n in NUM_COLS_RAW if n in df.columns]
     using_cols += [c + "_le" for c in CAT_COLS_RAW if c in df.columns]
