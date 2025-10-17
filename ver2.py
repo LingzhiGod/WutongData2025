@@ -70,13 +70,15 @@ np.random.seed(RANDOM_STATE)
 lgbm_default_params = dict(
         objective="binary",
         metric=["binary_logloss", "auc"],
-        learning_rate=0.05,
-        num_leaves=63,
-        max_depth=-1,
-        feature_fraction=0.8,
-        bagging_fraction=0.8,
+        learning_rate=0.09754,
+        num_leaves=100,
+        max_depth=0,
+        feature_fraction=0.85,
+        bagging_fraction=0.9,
         bagging_freq=1,
-        min_data_in_leaf=20,
+        min_data_in_leaf=10,
+        lambda_l1=0.10513682434194482,
+        lambda_l2=4.582925192780669,
         seed=RANDOM_STATE,
         n_jobs=-1,
         verbose=-1,
@@ -185,8 +187,12 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
 
         del clf, lgb_trn, lgb_val
         gc.collect()
-    oof_thr = float(np.mean(thresholds))
-    print("[OOF] Using average limit: thr={oof_thr:.3f}")
+
+    thr_candidates = np.linspace(0.05, 0.95, 322)
+    f1s = [f1_score(y, (oof_pred >= t).astype(int)) for t in thr_candidates]
+    oof_thr = float(thr_candidates[int(np.argmax(f1s))])
+
+    print(f"[OOF] Using global best thr: thr={oof_thr:.3f}")
     fi_df = pd.concat(fi_list, axis=0, ignore_index=True)
     return oof_pred, tst_pred, fi_df, oof_thr
 
@@ -253,6 +259,8 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
 
     # New Feature Generation
     using_cols = []
+    local_cat_cols = CAT_COLS_RAW.copy()
+    local_num_cols = NUM_COLS_RAW.copy()
 
     avg_call = df.get("call_duration(minutes)", 0)
     total_call_count = df.get("monthly_call_count", 0)
@@ -285,22 +293,37 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
     # Price per MB (robust handling when total_data == 0)
     price = pd.to_numeric(df.get("tariff_price(RMB)", 0), errors="coerce")
     data_mb = pd.to_numeric(df.get("total_data(MB)", 0), errors="coerce")
-    df["no_data_allowance_flag"] = (data_mb <= 0).astype(int)
     # 当总流量为 0 时，该值不可定义：设为 NaN 以让树模型按缺失处理，并配合 no_data_allowance_flag 提示语义
     df["price_per_mb"] = np.where(data_mb > 0, price / data_mb, np.nan)
-    using_cols.append("no_data_allowance_flag")
     using_cols.append("price_per_mb")
-    CAT_COLS_RAW.append("no_data_allowance_flag")
+
+    df["no_data_allowance_flag"] = (data_mb <= 0).astype(int)
+    local_cat_cols.append("no_data_allowance_flag")
+
+    R9_11 = df.get("residence_duration_9to11", 0)
+    R11_14 = df.get("residence_duration_11to14", 0)
+    R14_17 = df.get("residence_duration_14to17", 0)
+    R17_21 = df.get("residence_duration_17to21", 0)
+    R21_23 = df.get("residence_duration_21to23", 0)
+    R24_6 = df.get("residence_duration_24to6", 0)
+    total_res = df.get("total_residence_duration", 0)
+
+    df["ratio_night"] = np.where(total_res == 0, 1/3, (R24_6 + R21_23) / total_res)
+    df["ratio_evening"] = np.where(total_res == 0, 1 / 3, R17_21 / total_res)
+    df["ratio_day"] = np.where(total_res == 0, 1 / 3, (R9_11 + R11_14 + R14_17) / total_res)
+    using_cols.append("ratio_night")
+    using_cols.append("ratio_evening")
+    using_cols.append("ratio_day")
 
     # Label Encoding
     if is_train:
-        for cat in CAT_COLS_RAW:
+        for cat in local_cat_cols:
             if cat in df.columns:
                 encoder = LabelEncoder()
                 df[cat + "_le"] = encoder.fit_transform(df[cat].astype(str))
                 encoders[cat] = encoder
     else:
-        for cat in CAT_COLS_RAW:
+        for cat in local_cat_cols:
             if cat in df.columns:
                 encoder = encoders.get(cat)
                 if encoder is not None:
@@ -310,8 +333,8 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
                                                      list(unseen))  # New value as UNK Label for code robust
                     df[cat + "_le"] = encoder.transform(df[cat].astype(str))
 
-    using_cols += [n for n in NUM_COLS_RAW if n in df.columns]
-    using_cols += [c + "_le" for c in CAT_COLS_RAW if c in df.columns]
+    using_cols += [n for n in local_num_cols if n in df.columns]
+    using_cols += [c + "_le" for c in local_cat_cols if c in df.columns]
     print("[Info]Features built, using " + str(len(using_cols)) + " features:", using_cols)
     df["__used_cols__"] = ",".join(using_cols)
     return df
@@ -338,7 +361,9 @@ def main():
     f1 = f1_score(y_true, oof_label)
     pre = precision_score(y_true, oof_label)
     rec = recall_score(y_true, oof_label)
-    print(f"[OOF] Acc={acc:.5f}  F1={f1:.5f}  P={pre:.5f}  R={rec:.5f}  Thr={thr:.3f}")
+
+    score = 0.7 * acc + 0.3 * f1
+    print(f"[OOF] Acc={acc:.5f}  F1={f1:.5f}  P={pre:.5f}  R={rec:.5f}  Thr={thr:.3f} Score: {score:.5f}")
 
     sub = pd.DataFrame({
         ID_COL: test[ID_COL].values,
