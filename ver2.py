@@ -12,6 +12,7 @@ import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
 from sklearn.preprocessing import LabelEncoder
+from scipy.stats import skew, kurtosis
 
 warnings.filterwarnings("ignore")
 
@@ -36,9 +37,7 @@ CAT_COLS_RAW = [
     "uses_shopping_app",
     "residence_base_station_id",  # 高基数ID，树模型可直接做类别特征
     "residence_cell_id",
-    "tariff_id",
-    REG_YEAR,
-    REG_MONTH,
+    "tariff_id"
 ]
 
 NUM_COLS_RAW = [
@@ -69,7 +68,8 @@ np.random.seed(RANDOM_STATE)
 
 lgbm_default_params = dict(
         objective="binary",
-        metric=["binary_logloss", "auc"],
+        metric=["binary_logloss", "auc","average_precision"],
+        #is_unbalance=True,
         learning_rate=0.09754,
         num_leaves=100,
         max_depth=0,
@@ -124,7 +124,7 @@ def load_best_params(default_params: dict, filename: str = "optuna_best_params.c
         return default_params
 
 
-def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, features: List[str]) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float]:
+def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, features: List[str], cat_features: List[str], num_features: List[str]) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float]:
     import lightgbm as lgb
 
     oof_pred = np.zeros(len(train_df))
@@ -139,14 +139,14 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
 
     lgbm_params = load_best_params(lgbm_default_params)
 
-    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_STATE)
+    skf = StratifiedKFold(n_splits=7, shuffle=True, random_state=RANDOM_STATE)
 
     for fold, (trn_idx, val_idx) in enumerate(skf.split(X, y), 1):
         X_trn, y_trn = X.iloc[trn_idx], y[trn_idx]
         X_val, y_val = X.iloc[val_idx], y[val_idx]
 
-        lgb_trn = lgb.Dataset(X_trn, label=y_trn)
-        lgb_val = lgb.Dataset(X_val, label=y_val)
+        lgb_trn = lgb.Dataset(X_trn, label=y_trn, categorical_feature=cat_features, free_raw_data=False)
+        lgb_val = lgb.Dataset(X_val, label=y_val, categorical_feature=cat_features, reference=lgb_trn, free_raw_data=False)
 
         clf = lgb.train(
             lgbm_params,
@@ -155,7 +155,7 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
             valid_sets=[lgb_trn, lgb_val],
             valid_names=["train", "valid"],
             callbacks=[
-                lgb.early_stopping(100),
+                lgb.early_stopping(200),
                 lgb.log_evaluation(100),
             ],
         )
@@ -256,6 +256,8 @@ encoders = {}
 
 def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
     df = df.copy()
+    local_cat_cols = CAT_COLS_RAW.copy()
+    local_num_cols = NUM_COLS_RAW.copy()
 
     # Process Date
     if DATE_COL in df.columns:
@@ -263,6 +265,10 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
         df[REG_YEAR] = df[DATE_COL].dt.year
         df[REG_MONTH] = df[DATE_COL].dt.month
         df[REG_DAY_SINCE_REF] = (df[DATE_COL] - REF_DATE).dt.days.astype("float32")  # 手动转换规定转换行为避免不可预料的错误
+        local_cat_cols.append(REG_YEAR)
+        local_cat_cols.append(REG_MONTH)
+        local_num_cols.append(REG_DAY_SINCE_REF)
+
     else:
         df[REG_YEAR] = np.nan
         df[REG_MONTH] = np.nan
@@ -276,29 +282,24 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
         if name in df.columns:
             df[name] = df[name].astype(str)
 
-    # New Feature Generation
-    using_cols = []
-    local_cat_cols = CAT_COLS_RAW.copy()
-    local_num_cols = NUM_COLS_RAW.copy()
-
     avg_call = df.get("call_duration(minutes)", 0)
     total_call_count = df.get("monthly_call_count", 0)
     total_call = avg_call * total_call_count
     df["total_call_duration"] = total_call
 
-    using_cols.append("total_call_duration")
+    local_num_cols.append("total_call_duration")
 
     weekend_call_count = df.get("monthly_weekend_call_count", 0)
     weekday_call_count = total_call_count - weekend_call_count
     df["monthly_weekday_call_count"] = weekday_call_count
-    using_cols.append("monthly_weekday_call_count")
+    local_num_cols.append("monthly_weekday_call_count")
 
     ratio_weekday_call = np.where(total_call_count == 0, 0.5, weekday_call_count / total_call_count)
     ratio_weekend_call = np.where(total_call_count == 0, 0.5, weekend_call_count / total_call_count)
     df["ratio_weekday_call"] = ratio_weekday_call
     df["ratio_weekend_call"] = ratio_weekend_call
-    using_cols.append("ratio_weekday_call")
-    using_cols.append("ratio_weekend_call")
+    local_num_cols.append("ratio_weekday_call")
+    local_num_cols.append("ratio_weekend_call")
 
     avg_weekday_call_dura = df.get("avg_weekday_call_duration(minutes)", 0)
     avg_weekend_call_dura = df.get("avg_weekend_call_duration(minutes)", 0)
@@ -306,15 +307,15 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
     ratio_weekend_call_dura = np.where(total_call == 0, 0.5, avg_weekend_call_dura * weekend_call_count / total_call)
     df["ratio_weekday_call_dura"] = ratio_weekday_call_dura
     df["ratio_weekend_call_dura"] = ratio_weekend_call_dura
-    using_cols.append("ratio_weekday_call_dura")
-    using_cols.append("ratio_weekend_call_dura")
+    local_num_cols.append("ratio_weekday_call_dura")
+    local_num_cols.append("ratio_weekend_call_dura")
 
     # Price per MB (robust handling when total_data == 0)
     price = pd.to_numeric(df.get("tariff_price(RMB)", 0), errors="coerce")
     data_mb = pd.to_numeric(df.get("total_data(MB)", 0), errors="coerce")
     # 当总流量为 0 时，该值不可定义：设为 NaN 以让树模型按缺失处理，并配合 no_data_allowance_flag 提示语义
     df["price_per_mb"] = np.where(data_mb > 0, price / data_mb, np.nan)
-    using_cols.append("price_per_mb")
+    local_num_cols.append("price_per_mb")
 
     df["no_data_allowance_flag"] = (data_mb <= 0).astype(int)
     local_cat_cols.append("no_data_allowance_flag")
@@ -330,10 +331,34 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
     df["ratio_night"] = np.where(total_res == 0, 1/3, (R24_6 + R21_23) / total_res)
     df["ratio_evening"] = np.where(total_res == 0, 1 / 3, R17_21 / total_res)
     df["ratio_day"] = np.where(total_res == 0, 1 / 3, (R9_11 + R11_14 + R14_17) / total_res)
-    using_cols.append("ratio_night")
-    using_cols.append("ratio_evening")
-    using_cols.append("ratio_day")
+    local_num_cols.append("ratio_night")
+    local_num_cols.append("ratio_evening")
+    local_num_cols.append("ratio_day")
 
+    durations = df[[f"residence_duration_{p}" for p in ["9to11", "11to14", "14to17", "17to21", "21to23", "24to6"]]].fillna(0).values
+    p = durations / (durations.sum(axis=1, keepdims=True) + 1e-6)
+    df["res_duration_entropy"] = -(p * np.log(p + 1e-9)).sum(axis=1)
+    local_num_cols.append("res_duration_entropy")
+
+    uniform = np.full_like(p, 1/len(durations))
+    df["residence_kl_to_uniform"] = np.sum(p * np.log((p+1e-9)/(uniform+1e-9)), axis=1)
+    df["residence_gini"] = 1 - np.sum(p**2, axis=1)
+    local_num_cols.append("residence_kl_to_uniform")
+    local_num_cols.append("residence_gini")
+
+    df["residence_symmetry"] = 1 - np.abs(df["ratio_day"] - df["ratio_night"])
+    local_num_cols.append("residence_symmetry")
+
+    df["day_night_square_diff"] = (df["ratio_day"] - df["ratio_night"]) ** 2
+    local_num_cols.append("day_night_square_diff")
+
+    df["day_night_res_diff"] = df["ratio_day"] - df["ratio_night"]
+    df["evening_day_diff"] = df["ratio_evening"] - df["ratio_day"]
+    local_num_cols.append("day_night_res_diff")
+    local_num_cols.append("evening_day_diff")
+
+    df["is_school_open_season"] = df["reg_month"].isin([3, 9]).astype(int)
+    local_num_cols.append("is_school_open_season")
     # Label Encoding
     if is_train:
         for cat in local_cat_cols:
@@ -351,11 +376,13 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
                         encoder.classes_ = np.append(encoder.classes_,
                                                      list(unseen))  # New value as UNK Label for code robust
                     df[cat + "_le"] = encoder.transform(df[cat].astype(str))
-
+    using_cols = []
     using_cols += [n for n in local_num_cols if n in df.columns]
     using_cols += [c + "_le" for c in local_cat_cols if c in df.columns]
     print("[Info]Features built, using " + str(len(using_cols)) + " features:", using_cols)
     df["__used_cols__"] = ",".join(using_cols)
+    df["__cat_le_cols__"] = ",".join([c + "_le" for c in local_cat_cols if c in df.columns])
+    df["__num_cols__"] = ",".join([n for n in local_num_cols if n in df.columns])
     return df
 
 def main():
@@ -365,8 +392,10 @@ def main():
     test_fe = build_features(test, is_train=False)
 
     using_cols = train_fe["__used_cols__"].iloc[0].split(",")
+    cat_le_cols = train_fe["__cat_le_cols__"].iloc[0].split(",")
+    num_cols = train_fe["__num_cols__"].iloc[0].split(",")
 
-    oof, pred, fi_df, thr = fit_predict_with_lgbm(train_fe, test_fe, using_cols)
+    oof, pred, fi_df, thr = fit_predict_with_lgbm(train_fe, test_fe, using_cols, cat_le_cols, num_cols)
     try:
         import lightgbm
         print("[INFO]Training LGBM...")

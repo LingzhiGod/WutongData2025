@@ -35,7 +35,8 @@ def objective(trial):
     # 1️⃣ 定义搜索空间
     params = {
         "objective": "binary",
-        "metric": "binary_logloss",
+        "metric": ["binary_logloss","auc","average_precision"],
+        #"is_unbalance": True,
         "boosting_type": "gbdt",
         "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
         "num_leaves": trial.suggest_int("num_leaves", 31, 255, step=16),
@@ -46,6 +47,13 @@ def objective(trial):
         "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 10, 200),
         "lambda_l1": trial.suggest_float("lambda_l1", 0.0, 5.0),
         "lambda_l2": trial.suggest_float("lambda_l2", 0.0, 5.0),
+        "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
+        "min_split_gain": trial.suggest_float("min_split_gain", 0, 1),
+        "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.5, 3),
+        "max_bin": trial.suggest_int("max_bin", 128, 512),
+        "extra_trees": trial.suggest_categorical("extra_trees", [True, False]),
+        "extra_trees_frequency": trial.suggest_int("extra_trees_frequency", 1, 10),
+        "boost_from_average": trial.suggest_categorical("boost_from_average", [True, False]),
         "n_jobs": -1,
         "seed": ver2.RANDOM_STATE,
         "verbose": -1,
@@ -57,22 +65,23 @@ def objective(trial):
     test_df = ver2.build_features(test_df, is_train=False)
 
     used_cols = train_df["__used_cols__"].iloc[0].split(",")
+    cat_le_cols = train_df["__cat_le_cols__"].iloc[0].split(",")
+    num_cols = train_df["__num_cols__"].iloc[0].split(",")
 
     # 3️⃣ 准备数据
     X = train_df[used_cols]
     y = train_df[ver2.TARGET].astype(int).values
-    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=ver2.RANDOM_STATE)
+    skf = StratifiedKFold(n_splits=7, shuffle=True, random_state=ver2.RANDOM_STATE)
 
     oof_pred = np.zeros(len(y))
-    thresholds = []
 
     # 4️⃣ 交叉验证
     for fold, (trn_idx, val_idx) in enumerate(skf.split(X, y), 1):
         X_trn, X_val = X.iloc[trn_idx], X.iloc[val_idx]
         y_trn, y_val = y[trn_idx], y[val_idx]
 
-        dtrain = lgb.Dataset(X_trn, label=y_trn)
-        dvalid = lgb.Dataset(X_val, label=y_val)
+        dtrain = lgb.Dataset(X_trn, label=y_trn, categorical_feature=cat_le_cols, free_raw_data=False)
+        dvalid = lgb.Dataset(X_val, label=y_val, categorical_feature=cat_le_cols, reference=dtrain, free_raw_data=False)
 
         clf = lgb.train(
             params,
@@ -80,38 +89,33 @@ def objective(trial):
             valid_sets=[dtrain, dvalid],
             num_boost_round=2000,
             callbacks=[
-                lgb.early_stopping(100),
+                lgb.early_stopping(200),
                 lgb.log_evaluation(200),
             ],
         )
 
         val_prob = clf.predict(X_val, num_iteration=clf.best_iteration)
         oof_pred[val_idx] = val_prob
-
-        # 阈值扫描
-        thr_candidates = np.linspace(0.2, 0.8, 61)
-        f1s = [f1_score(y_val, (val_prob >= thr).astype(int)) for thr in thr_candidates]
-        thresholds.append(thr_candidates[np.argmax(f1s)])
-
         del clf, dtrain, dvalid
         gc.collect()
 
     oof_thr, best_score, values = ver2.pick_best_threshold_by_score(y, oof_pred, step=0.01)
     f1 = values[1]
     print(f"[Trial] best F1={f1:.5f}  best_thr={oof_thr:.3f}")
-    return f1
+    return best_score
 
 
 # ===================================================
 # 主函数入口
-# ===================================================
+# ===================================================\
+from optuna.samplers import TPESampler
 def main():
     print("🚀 Starting LightGBM parameter tuning using Optuna ...")
-    study = optuna.create_study(direction="maximize", study_name="lgbm_tune")
+    study = optuna.create_study(direction="maximize", study_name="lgbm_tune",sampler= TPESampler(multivariate=True, group=True, seed=ver2.RANDOM_STATE))
     study.optimize(objective, n_trials=60, show_progress_bar=True)
 
     print("\n=================== 最优结果 ===================")
-    print(f"✅ 最优F1: {study.best_value:.5f}")
+    print(f"✅ 最优Score: {study.best_value:.5f}")
     print("🏆 最优参数组合:")
     for k, v in study.best_params.items():
         print(f"  {k}: {v}")
