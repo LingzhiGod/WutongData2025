@@ -188,11 +188,7 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
         del clf, lgb_trn, lgb_val
         gc.collect()
 
-    thr_candidates = np.linspace(0.05, 0.95, 322)
-    f1s = [f1_score(y, (oof_pred >= t).astype(int)) for t in thr_candidates]
-    oof_thr = float(thr_candidates[int(np.argmax(f1s))])
-
-    print(f"[OOF] Using global best thr: thr={oof_thr:.3f}")
+    oof_thr, best_score, (acc, f1, pre, rec) = pick_best_threshold_by_score(y, oof_pred, step=0.01)
     fi_df = pd.concat(fi_list, axis=0, ignore_index=True)
     return oof_pred, tst_pred, fi_df, oof_thr
 
@@ -229,6 +225,29 @@ def wow(a,b,total,which):
     if total == 0:
         return 0.5
     return np.where(which, a, b) / total
+
+def pick_best_threshold_by_score(y_true, prob, step=0.005):
+    ths = np.arange(0.05, 0.95 + 1e-9, step)
+    best_thr, best_score = 0, -1
+    best_acc, best_f1, best_p, best_r = 0, 0, 0, 0
+
+    for t in ths:
+        pred = (prob >= t).astype(int)
+        acc = accuracy_score(y_true, pred)
+        f1  = f1_score(y_true, pred, zero_division=0)
+        p   = precision_score(y_true, pred, zero_division=0)
+        r   = recall_score(y_true, pred)
+        score = 0.7 * acc + 0.3 * f1
+
+        if score > best_score:
+            best_score = score
+            best_thr = t
+            best_acc, best_f1, best_p, best_r = acc, f1, p, r
+
+    print(f"[THR Search] Best Score={best_score:.5f}  Acc={best_acc:.5f}  "
+          f"F1={best_f1:.5f}  P={best_p:.5f}  R={best_r:.5f}  Thr={best_thr:.3f}")
+    return best_thr, best_score, (best_acc, best_f1, best_p, best_r)
+
 #--------------------------------------
 #Feature Buildup
 #--------------------------------------

@@ -96,9 +96,9 @@ def objective(trial):
         del clf, dtrain, dvalid
         gc.collect()
 
-    avg_thr = np.mean(thresholds)
-    f1 = f1_score(y, (oof_pred >= avg_thr).astype(int))
-    print(f"[Trial] mean F1={f1:.5f}  avg_thr={avg_thr:.3f}")
+    oof_thr, best_score, values = ver2.pick_best_threshold_by_score(y, oof_pred, step=0.01)
+    f1 = values[1]
+    print(f"[Trial] best F1={f1:.5f}  best_thr={oof_thr:.3f}")
     return f1
 
 
@@ -108,7 +108,7 @@ def objective(trial):
 def main():
     print("🚀 Starting LightGBM parameter tuning using Optuna ...")
     study = optuna.create_study(direction="maximize", study_name="lgbm_tune")
-    study.optimize(objective, n_trials=50, show_progress_bar=True)
+    study.optimize(objective, n_trials=60, show_progress_bar=True)
 
     print("\n=================== 最优结果 ===================")
     print(f"✅ 最优F1: {study.best_value:.5f}")
