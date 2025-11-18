@@ -67,14 +67,15 @@ np.random.seed(RANDOM_STATE)
 lgbm_default_params = dict(
     objective="binary",
     metric=["binary_logloss", "auc","average_precision"],
+    first_metric_only=True,
     boosting_type="gbdt",
     is_unbalance=True,
-    learning_rate=0.05,
+    learning_rate=0.03,
 
-    num_leaves=95,
-    max_depth=7,
-    min_data_in_leaf=180,
-    min_split_gain=0.60,
+    num_leaves=31,
+    max_depth=5,
+    min_data_in_leaf=225,
+    min_split_gain=0.45,
 
 
     feature_fraction=0.85,
@@ -166,11 +167,11 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
         clf = lgb.train(
             lgbm_params,
             lgb_trn,
-            num_boost_round=1000,
+            num_boost_round=2000,
             valid_sets=[lgb_trn, lgb_val],
             valid_names=["train", "valid"],
             callbacks=[
-                lgb.early_stopping(40),
+                lgb.early_stopping(200),
                 lgb.log_evaluation(20),
             ],
         )
