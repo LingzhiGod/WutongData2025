@@ -69,24 +69,21 @@ lgbm_default_params = dict(
     metric=["binary_logloss", "auc","average_precision"],
     boosting_type="gbdt",
     is_unbalance=True,
-    learning_rate=0.010,  # 稍微保守一点，配合长轮数+早停
-    num_leaves=95,  # 不再那么凶（239），但比63略有表达力
-    max_depth=-1,  # 用叶子数量+叶子最小样本控制复杂度
+    learning_rate=0.05,
 
-    # 抑制“细叶子”，减少边界误报
-    min_data_in_leaf=180,  # 95 → 180，直接拉粗叶子
-    min_sum_hessian_in_leaf=5.0,  # 每叶至少一定“信息量”
-    min_split_gain=0.60,  # 提高分裂门槛，过滤弱收益分裂
-    # n_estimators=1000,
+    num_leaves=95,
+    max_depth=7,
+    min_data_in_leaf=180,
+    min_split_gain=0.60,
 
-    # ===== 子采样，降低方差 + 抑制共线误判 =====
-    feature_fraction=0.85,  # 千万别再用 1.0 了
-    bagging_fraction=0.85,  # 比 0.9 再保守一点
+
+    feature_fraction=0.85,
+    bagging_fraction=0.85,
     bagging_freq=1,
 
-    # ===== 正则化 =====
-    lambda_l1=1.6,
-    lambda_l2=3.0,  # 比你原来的 2.72 稍微再高一点
+    # # ===== 正则化 =====
+    # lambda_l1=1.6,
+    # lambda_l2=3.0,
 
     seed=RANDOM_STATE,
     n_jobs=-1,
@@ -142,7 +139,6 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
     tst_pred = np.zeros(len(test_df))
 
     fi_list = []
-    thresholds = []
 
     X = train_df[features]
     y = train_df[TARGET].astype(int).values
@@ -153,9 +149,13 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
     lgbm_params.pop("is_unbalance", None)
     lgbm_params["scale_pos_weight"] = compute_scale(y)
 
-    skf = StratifiedKFold(n_splits=7, shuffle=True, random_state=RANDOM_STATE)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+    fold_ids = np.zeros(len(train_df), dtype=int)
 
     for fold, (trn_idx, val_idx) in enumerate(skf.split(X, y), 1):
+        fold_ids[val_idx] = fold
+
         X_trn, y_trn = X.iloc[trn_idx], y[trn_idx]
         X_val, y_val = X.iloc[val_idx], y[val_idx]
 
@@ -166,27 +166,18 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
         clf = lgb.train(
             lgbm_params,
             lgb_trn,
-            num_boost_round=20000,
+            num_boost_round=1000,
             valid_sets=[lgb_trn, lgb_val],
             valid_names=["train", "valid"],
             callbacks=[
-                lgb.early_stopping(1000),
-                lgb.log_evaluation(200),
+                lgb.early_stopping(40),
+                lgb.log_evaluation(20),
             ],
         )
 
         # 验证集预测 + 阈值搜索（按F1最大化）
         val_prob = clf.predict(X_val, num_iteration=clf.best_iteration)
         oof_pred[val_idx] = val_prob
-
-        # 阈值扫描
-        thr_candidates = np.linspace(0.2, 0.8, 61)  # 0.2~0.8 步长0.01
-        f1s = []
-        for thr in thr_candidates:
-            f1s.append(f1_score(y_val, (val_prob >= thr).astype(int)))
-        best_thr = float(thr_candidates[int(np.argmax(f1s))])
-        thresholds.append(best_thr)
-        print(f"[Fold {fold}] best F1={max(f1s):.5f} @ thr={best_thr:.3f}")
 
         # 测试集预测累计
         tst_prob = clf.predict(X_test, num_iteration=clf.best_iteration)
@@ -203,10 +194,8 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
         del clf, lgb_trn, lgb_val
         gc.collect()
 
-    oof_thr, best_score, (acc, f1, pre, rec) = search_threshold_two_stage(y, oof_pred, coarse_step=0.01,
-                                                                          fine_window=0.04, fine_step=0.0005)
     fi_df = pd.concat(fi_list, axis=0, ignore_index=True)
-    return oof_pred, tst_pred, fi_df, oof_thr
+    return oof_pred, tst_pred, fi_df, fold_ids
 
 
 # --------------------------------------
@@ -257,35 +246,85 @@ def platform_score(y_true, y_pred_bin):
     f1 = f1_score(y_true, y_pred_bin, zero_division=0)
     return 0.7 * acc + 0.3 * f1
 
+def choose_threshold_generalization(
+    y_true: np.ndarray,
+    prob: np.ndarray,
+    fold_ids: np.ndarray,
+    thr_min: float = 0.05,
+    thr_max: float = 0.95,
+    thr_step: float = 0.001,
+    delta_f1: float = 0.002,
+    alpha_pos: float = 1.0,   # 阳性率偏离惩罚
+    beta_var: float = 0.5,    # 折间 F1 方差惩罚
+    pos_rate_target: float | None = None,
+):
+    """
+    泛化优先的阈值选择：
+    1) 先找全局 F1 最大的 F1_max
+    2) 只在 F1 >= F1_max - delta_f1 的“高 F1 区间”里选阈值
+    3) 在该区间中综合考虑：
+       - 阳性率离 pos_rate_target 的距离（越近越好）
+       - 各折 F1 的方差（越小越好）
+       - 全局 F1（越高越好）
+    """
+    if pos_rate_target is None:
+        pos_rate_target = float(np.mean(y_true))
+        print(f"[GenThr] pos_rate_target not given, use train pos_rate={pos_rate_target:.5f}")
 
-def search_threshold_two_stage(y_true, prob, coarse_step=0.01, fine_window=0.03, fine_step=0.0005):
-    # 粗扫
-    ths = np.arange(0.05, 0.95 + 1e-9, coarse_step)
-    best_thr, best_score = 0.5, -1.0
+    ths = np.arange(thr_min, thr_max + 1e-9, thr_step)
+
+    # 先算每个阈值的全局 F1
+    f1_list = []
     for t in ths:
         pred = (prob >= t).astype(int)
-        sc = platform_score(y_true, pred)
-        if sc > best_score:
-            best_score, best_thr = sc, t
-    # 细扫（在最佳附近 ± fine_window/2）
-    lo = max(0.0, best_thr - fine_window / 2)
-    hi = min(1.0, best_thr + fine_window / 2)
-    t = lo
-    while t <= hi + 1e-12:
+        f1_glb = f1_score(y_true, pred, zero_division=0)
+        f1_list.append(f1_glb)
+
+    f1_max = max(f1_list)
+
+    # 高 F1 阈值集合
+    high_f1_ths = [t for t, f1_g in zip(ths, f1_list) if f1_g >= f1_max - delta_f1]
+    if not high_f1_ths:
+        high_f1_ths = list(ths)  # 兜底
+
+    best = None
+
+    for t in high_f1_ths:
         pred = (prob >= t).astype(int)
-        sc = platform_score(y_true, pred)
-        if sc > best_score:
-            best_score, best_thr = sc, t
-        t += fine_step
-    # 回填详细指标（便于日志）
-    pred = (prob >= best_thr).astype(int)
-    acc = accuracy_score(y_true, pred)
-    f1 = f1_score(y_true, pred, zero_division=0)
-    pre = precision_score(y_true, pred, zero_division=0)
-    rec = recall_score(y_true, pred, zero_division=0)
+        f1_glb = f1_score(y_true, pred, zero_division=0)
+        pos_rate = pred.mean()
+
+        # 各折 F1
+        f1_folds = []
+        for fold in np.unique(fold_ids):
+            idx = (fold_ids == fold)
+            if idx.sum() == 0:
+                continue
+            f1_k = f1_score(y_true[idx], pred[idx], zero_division=0)
+            f1_folds.append(f1_k)
+        var_f1 = np.var(f1_folds) if len(f1_folds) > 1 else 0.0
+
+        # 惩罚：阳性率偏离 + 折间方差
+        penalty = alpha_pos * abs(pos_rate - pos_rate_target) + beta_var * var_f1
+        eff = f1_glb - penalty
+
+        if (best is None) or (eff > best["eff"]):
+            best = dict(
+                thr=t,
+                eff=eff,
+                f1_glb=f1_glb,
+                pos_rate=pos_rate,
+                var_f1=var_f1,
+                penalty=penalty,
+            )
+
     print(
-        f"[THR 2-Stage] Score={best_score:.5f}  Acc={acc:.5f}  F1={f1:.5f}  P={pre:.5f}  R={rec:.5f}  Thr={best_thr:.5f}")
-    return best_thr, best_score, (acc, f1, pre, rec)
+        "[GenThr] thr={thr:.5f} eff={eff:.5f} F1_glb={f1_glb:.5f} "
+        "pos_rate={pos_rate:.5f} var_F1={var_f1:.5f} penalty={penalty:.5f} "
+        "(F1_max={f1_max:.5f}, delta_f1={delta_f1:.4f})"
+        .format(f1_max=f1_max, delta_f1=delta_f1, **best)
+    )
+    return best["thr"], best
 
 
 def pick_best_threshold_by_score(y_true, prob, step=0.005):
@@ -461,7 +500,6 @@ def main():
     cat_le_cols = train_fe["__cat_le_cols__"].iloc[0].split(",")
     num_cols = train_fe["__num_cols__"].iloc[0].split(",")
 
-    oof, pred, fi_df, thr = fit_predict_with_lgbm(train_fe, test_fe, using_cols, cat_le_cols, num_cols)
     try:
         import lightgbm
         print("[INFO]Training LGBM...")
@@ -469,14 +507,32 @@ def main():
         print("[ERROR] Failed when training by using lightgbm.")
         print("[ERROR] Error: " + str(e_lgb))
 
+    oof, pred, fi_df, fold_ids = fit_predict_with_lgbm(
+        train_fe, test_fe, using_cols, cat_le_cols, num_cols
+    )
+
     y_true = train[TARGET].astype(int).values
+
+    thr, info = choose_threshold_generalization(
+        y_true=y_true,
+        prob=oof,
+        fold_ids=fold_ids,
+        thr_min=0.05,
+        thr_max=0.95,
+        thr_step=0.001,
+        delta_f1=0.002,
+        alpha_pos=1.0,
+        beta_var=0.5,
+        pos_rate_target=None,  # 自动用 train 里的正例率≈13%
+    )
+
     oof_label = (oof >= thr).astype(int)
     acc = accuracy_score(y_true, oof_label)
     f1 = f1_score(y_true, oof_label)
     pre = precision_score(y_true, oof_label)
     rec = recall_score(y_true, oof_label)
-
     score = 0.7 * acc + 0.3 * f1
+
     print(f"[OOF] Acc={acc:.5f}  F1={f1:.5f}  P={pre:.5f}  R={rec:.5f}  Thr={thr:.3f} Score: {score:.5f}")
 
     sub = pd.DataFrame({
