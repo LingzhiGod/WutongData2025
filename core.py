@@ -1,9 +1,7 @@
 import os
 import sys
 import gc
-import math
 import glob
-import json
 import warnings
 from typing import List, Tuple, Dict
 
@@ -13,13 +11,12 @@ from numpy import ndarray
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
 from sklearn.preprocessing import LabelEncoder
-from scipy.stats import skew, kurtosis
 
 warnings.filterwarnings("ignore")
 
-#--------------------------------------
-#Constant Pool
-#--------------------------------------
+# --------------------------------------
+# Constant Pool
+# --------------------------------------
 TRAIN_FP = "./train.csv"
 TEST_FP = "./test.csv"
 
@@ -65,33 +62,38 @@ NUM_COLS_RAW = [
 REF_DATE = pd.to_datetime("2020-12-31")
 RANDOM_STATE = 20070702
 np.random.seed(RANDOM_STATE)
-#--------------------------------------
+# --------------------------------------
 
 lgbm_default_params = dict(
-        objective="binary",
-        metric=["binary_logloss", "auc","average_precision"],
-        boosting_type="gbdt",
-        is_unbalance=True,
-        learning_rate=0.075,
-        n_estimators=1000,
-        min_split_gain=0.0,
-        min_child_weight = 1,
- 
-        max_depth = -1,
-        num_leaves= 95,
-        subsample = 0.8,
-        colsample_bytree = 0.8,
-        lambda_l1=0,
-        lambda_l2=0,
-        #
-        # feature_fraction=0.85,
-        # bagging_fraction=0.85,
-        # bagging_freq=1,
-        # min_split_gain=0.60,
-        seed=RANDOM_STATE,
-        n_jobs=-1,
-        verbose=-1,
+    objective="binary",
+    metric=["binary_logloss", "auc","average_precision"],
+    boosting_type="gbdt",
+    is_unbalance=True,
+    learning_rate=0.010,  # 稍微保守一点，配合长轮数+早停
+    num_leaves=95,  # 不再那么凶（239），但比63略有表达力
+    max_depth=-1,  # 用叶子数量+叶子最小样本控制复杂度
+
+    # 抑制“细叶子”，减少边界误报
+    min_data_in_leaf=180,  # 95 → 180，直接拉粗叶子
+    min_sum_hessian_in_leaf=5.0,  # 每叶至少一定“信息量”
+    min_split_gain=0.60,  # 提高分裂门槛，过滤弱收益分裂
+    # n_estimators=1000,
+
+    # ===== 子采样，降低方差 + 抑制共线误判 =====
+    feature_fraction=0.85,  # 千万别再用 1.0 了
+    bagging_fraction=0.85,  # 比 0.9 再保守一点
+    bagging_freq=1,
+
+    # ===== 正则化 =====
+    lambda_l1=1.6,
+    lambda_l2=3.0,  # 比你原来的 2.72 稍微再高一点
+
+    seed=RANDOM_STATE,
+    n_jobs=-1,
+    verbose=-1,
 )
+
+
 
 def load_best_params(default_params: dict, filename: str = "optuna_best_params.csv") -> dict:
     if not os.path.exists(filename):
@@ -132,9 +134,8 @@ def load_best_params(default_params: dict, filename: str = "optuna_best_params.c
         print(f"[Optuna]Failed when loading best param：{e}")
         return default_params
 
-import random
-
-def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, features: List[str], cat_features: List[str], num_features: List[str]) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float]:
+def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, features: List[str], cat_features: List[str],
+                          num_features: List[str]) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float]:
     import lightgbm as lgb
 
     oof_pred = np.zeros(len(train_df))
@@ -159,17 +160,18 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
         X_val, y_val = X.iloc[val_idx], y[val_idx]
 
         lgb_trn = lgb.Dataset(X_trn, label=y_trn, categorical_feature=cat_features, free_raw_data=False)
-        lgb_val = lgb.Dataset(X_val, label=y_val, categorical_feature=cat_features, reference=lgb_trn, free_raw_data=False)
+        lgb_val = lgb.Dataset(X_val, label=y_val, categorical_feature=cat_features, reference=lgb_trn,
+                              free_raw_data=False)
 
         clf = lgb.train(
             lgbm_params,
             lgb_trn,
-            num_boost_round=500,
+            num_boost_round=20000,
             valid_sets=[lgb_trn, lgb_val],
             valid_names=["train", "valid"],
             callbacks=[
-                lgb.early_stopping(50),
-                lgb.log_evaluation(50),
+                lgb.early_stopping(1000),
+                lgb.log_evaluation(200),
             ],
         )
 
@@ -201,14 +203,15 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
         del clf, lgb_trn, lgb_val
         gc.collect()
 
-    oof_thr, best_score, (acc, f1, pre, rec) = search_threshold_two_stage(y, oof_pred, coarse_step=0.01, fine_window=0.04, fine_step=0.0005)
+    oof_thr, best_score, (acc, f1, pre, rec) = search_threshold_two_stage(y, oof_pred, coarse_step=0.01,
+                                                                          fine_window=0.04, fine_step=0.0005)
     fi_df = pd.concat(fi_list, axis=0, ignore_index=True)
     return oof_pred, tst_pred, fi_df, oof_thr
 
 
-#--------------------------------------
+# --------------------------------------
 # Util functions
-#--------------------------------------
+# --------------------------------------
 def find_file(candidates: List[str]) -> str:
     for pat in candidates:
         files = glob.glob(pat)
@@ -234,7 +237,7 @@ def load_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
 def compute_scale(y: ndarray, eps: float = 1e-6) -> float:
     pos = (y == 1).sum()
     neg = (y == 0).sum()
-    if pos == 0 :
+    if pos == 0:
         print("[WARNING]No positive samples found when computing scale. Return 1.0")
         return 1.0
     spw = neg / (pos + eps)
@@ -244,15 +247,16 @@ def compute_scale(y: ndarray, eps: float = 1e-6) -> float:
 def safe_div(a, b):
     return a / np.where(b == 0, 1, b)
 
-def wow(a,b,total,which):
+def wow(a, b, total, which):
     if total == 0:
         return 0.5
     return np.where(which, a, b) / total
 
 def platform_score(y_true, y_pred_bin):
     acc = accuracy_score(y_true, y_pred_bin)
-    f1  = f1_score(y_true, y_pred_bin, zero_division=0)
+    f1 = f1_score(y_true, y_pred_bin, zero_division=0)
     return 0.7 * acc + 0.3 * f1
+
 
 def search_threshold_two_stage(y_true, prob, coarse_step=0.01, fine_window=0.03, fine_step=0.0005):
     # 粗扫
@@ -264,8 +268,8 @@ def search_threshold_two_stage(y_true, prob, coarse_step=0.01, fine_window=0.03,
         if sc > best_score:
             best_score, best_thr = sc, t
     # 细扫（在最佳附近 ± fine_window/2）
-    lo = max(0.0, best_thr - fine_window/2)
-    hi = min(1.0, best_thr + fine_window/2)
+    lo = max(0.0, best_thr - fine_window / 2)
+    hi = min(1.0, best_thr + fine_window / 2)
     t = lo
     while t <= hi + 1e-12:
         pred = (prob >= t).astype(int)
@@ -276,11 +280,13 @@ def search_threshold_two_stage(y_true, prob, coarse_step=0.01, fine_window=0.03,
     # 回填详细指标（便于日志）
     pred = (prob >= best_thr).astype(int)
     acc = accuracy_score(y_true, pred)
-    f1  = f1_score(y_true, pred, zero_division=0)
+    f1 = f1_score(y_true, pred, zero_division=0)
     pre = precision_score(y_true, pred, zero_division=0)
     rec = recall_score(y_true, pred, zero_division=0)
-    print(f"[THR 2-Stage] Score={best_score:.5f}  Acc={acc:.5f}  F1={f1:.5f}  P={pre:.5f}  R={rec:.5f}  Thr={best_thr:.5f}")
+    print(
+        f"[THR 2-Stage] Score={best_score:.5f}  Acc={acc:.5f}  F1={f1:.5f}  P={pre:.5f}  R={rec:.5f}  Thr={best_thr:.5f}")
     return best_thr, best_score, (acc, f1, pre, rec)
+
 
 def pick_best_threshold_by_score(y_true, prob, step=0.005):
     ths = np.arange(0.05, 0.95 + 1e-9, step)
@@ -290,9 +296,9 @@ def pick_best_threshold_by_score(y_true, prob, step=0.005):
     for t in ths:
         pred = (prob >= t).astype(int)
         acc = accuracy_score(y_true, pred)
-        f1  = f1_score(y_true, pred, zero_division=0)
-        p   = precision_score(y_true, pred, zero_division=0)
-        r   = recall_score(y_true, pred)
+        f1 = f1_score(y_true, pred, zero_division=0)
+        p = precision_score(y_true, pred, zero_division=0)
+        r = recall_score(y_true, pred)
         score = 0.7 * acc + 0.3 * f1
 
         if score > best_score:
@@ -304,9 +310,10 @@ def pick_best_threshold_by_score(y_true, prob, step=0.005):
           f"F1={best_f1:.5f}  P={best_p:.5f}  R={best_r:.5f}  Thr={best_thr:.3f}")
     return best_thr, best_score, (best_acc, best_f1, best_p, best_r)
 
-#--------------------------------------
-#Feature Buildup
-#--------------------------------------
+
+# --------------------------------------
+# Feature Buildup
+# --------------------------------------
 
 encoders = {}
 
@@ -384,14 +391,16 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
     R24_6 = df.get("residence_duration_24to6", 0)
     total_res = df.get("total_residence_duration", 0)
 
-    df["ratio_night"] = np.where(total_res == 0, 1/3, (R24_6 + R21_23) / total_res)
+    df["ratio_night"] = np.where(total_res == 0, 1 / 3, (R24_6 + R21_23) / total_res)
     df["ratio_evening"] = np.where(total_res == 0, 1 / 3, R17_21 / total_res)
     df["ratio_day"] = np.where(total_res == 0, 1 / 3, (R9_11 + R11_14 + R14_17) / total_res)
     local_num_cols.append("ratio_night")
     local_num_cols.append("ratio_evening")
     local_num_cols.append("ratio_day")
 
-    durations = df[[f"residence_duration_{p}" for p in ["9to11", "11to14", "14to17", "17to21", "21to23", "24to6"]]].fillna(0).values
+    durations = df[
+        [f"residence_duration_{p}" for p in ["9to11", "11to14", "14to17", "17to21", "21to23", "24to6"]]].fillna(
+        0).values
     p = durations / (durations.sum(axis=1, keepdims=True) + 1e-6)
     df["res_duration_entropy"] = -(p * np.log(p + 1e-9)).sum(axis=1)
     local_num_cols.append("res_duration_entropy")
@@ -441,6 +450,7 @@ def build_features(df: pd.DataFrame, is_train: bool) -> pd.DataFrame:
     df["__num_cols__"] = ",".join([n for n in local_num_cols if n in df.columns])
     return df
 
+
 def main():
     train, test = load_data()
 
@@ -478,9 +488,10 @@ def main():
 
     # 保存特征重要性
     if fi_df is not None and not fi_df.empty:
-        fi_agg = fi_df.groupby("feature", as_index=False)["importance"].mean().sort_values("importance", ascending=False)
+        fi_agg = fi_df.groupby("feature", as_index=False)["importance"].mean().sort_values("importance",ascending=False)
         fi_agg.to_csv("feature_importance.csv", index=False)
         print("[OK] 已生成 feature_importance.csv（gain 平均值）")
+
 
 if __name__ == "__main__":
     main()
