@@ -78,8 +78,8 @@ lgbm_default_params = dict(
     min_split_gain=0.45,
 
 
-    feature_fraction=0.85,
-    bagging_fraction=0.85,
+    # feature_fraction=0.85,
+    # bagging_fraction=0.85,
     bagging_freq=1,
 
     # # ===== 正则化 =====
