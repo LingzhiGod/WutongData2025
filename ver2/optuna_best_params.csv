@@ -1,0 +1,2 @@
+learning_rate,num_leaves,max_depth,feature_fraction,bagging_fraction,min_data_in_leaf,lambda_l1,lambda_l2,min_child_samples,min_split_gain,scale_pos_weight,max_bin,extra_trees,extra_trees_frequency,boost_from_average,best_f1
+0.0245,239,6,1.0,0.9,95,1.6,2.721,76,0.44,6.6923,252,False,4,True,0.889229258033106

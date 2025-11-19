@@ -164,11 +164,11 @@ def fit_predict_with_lgbm(train_df: pd.DataFrame, test_df: pd.DataFrame, feature
         clf = lgb.train(
             lgbm_params,
             lgb_trn,
-            num_boost_round=500,
+            num_boost_round=2000,
             valid_sets=[lgb_trn, lgb_val],
             valid_names=["train", "valid"],
             callbacks=[
-                lgb.early_stopping(50),
+                lgb.early_stopping(500),
                 lgb.log_evaluation(50),
             ],
         )

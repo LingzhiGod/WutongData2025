@@ -70,7 +70,7 @@ lgbm_default_params = dict(
     first_metric_only=True,
     boosting_type="gbdt",
     is_unbalance=True,
-    learning_rate=0.03,
+    learning_rate=0.025,
 
     num_leaves=31,
     max_depth=5,
@@ -83,8 +83,8 @@ lgbm_default_params = dict(
     bagging_freq=1,
 
     # # ===== 正则化 =====
-    # lambda_l1=1.6,
-    # lambda_l2=3.0,
+    # lambda_l1=1.5,
+    # lambda_l2=0.85,
 
     seed=RANDOM_STATE,
     n_jobs=-1,
@@ -524,7 +524,7 @@ def main():
         delta_f1=0.002,
         alpha_pos=1.0,
         beta_var=0.5,
-        pos_rate_target=None,  # 自动用 train 里的正例率≈13%
+        pos_rate_target=6500 / 43500,  # 自动用 train 里的正例率≈13%
     )
 
     oof_label = (oof >= thr).astype(int)
